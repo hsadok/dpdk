@@ -1139,6 +1139,166 @@ rte_hash_lookup_bulk_data(const struct rte_hash *h, const void **keys,
 	return __builtin_popcountl(*hit_mask);
 }
 
+static inline void
+__rte_hash_lookup_with_hash_bulk(const struct rte_hash *h, const void **keys,
+			int32_t num_keys, int32_t *positions,
+			hash_sig_t *sigs, uint64_t *hit_mask, void *data[])
+{
+	uint64_t hits = 0;
+	int32_t i;
+	uint32_t prim_hash[RTE_HASH_LOOKUP_BULK_MAX];
+	uint32_t sec_hash[RTE_HASH_LOOKUP_BULK_MAX];
+	const struct rte_hash_bucket *primary_bkt[RTE_HASH_LOOKUP_BULK_MAX];
+	const struct rte_hash_bucket *secondary_bkt[RTE_HASH_LOOKUP_BULK_MAX];
+	uint32_t prim_hitmask[RTE_HASH_LOOKUP_BULK_MAX] = {0};
+	uint32_t sec_hitmask[RTE_HASH_LOOKUP_BULK_MAX] = {0};
+
+	/* Prefetch first keys */
+	for (i = 0; i < PREFETCH_OFFSET && i < num_keys; i++)
+		rte_prefetch0(keys[i]);
+
+	/*
+	 * Prefetch rest of the keys, calculate primary and
+	 * secondary bucket and prefetch them
+	 */
+	for (i = 0; i < (num_keys - PREFETCH_OFFSET); i++) {
+		rte_prefetch0(keys[i + PREFETCH_OFFSET]);
+
+		prim_hash[i] = sigs[i];
+		sec_hash[i] = rte_hash_secondary_hash(prim_hash[i]);
+
+		primary_bkt[i] = &h->buckets[prim_hash[i] & h->bucket_bitmask];
+		secondary_bkt[i] = &h->buckets[sec_hash[i] & h->bucket_bitmask];
+
+		rte_prefetch0(primary_bkt[i]);
+		rte_prefetch0(secondary_bkt[i]);
+	}
+
+	/* Calculate and prefetch rest of the buckets */
+	for (; i < num_keys; i++) {
+		prim_hash[i] = sigs[i];
+		sec_hash[i] = rte_hash_secondary_hash(prim_hash[i]);
+
+		primary_bkt[i] = &h->buckets[prim_hash[i] & h->bucket_bitmask];
+		secondary_bkt[i] = &h->buckets[sec_hash[i] & h->bucket_bitmask];
+
+		rte_prefetch0(primary_bkt[i]);
+		rte_prefetch0(secondary_bkt[i]);
+	}
+
+	/* Compare signatures and prefetch key slot of first hit */
+	for (i = 0; i < num_keys; i++) {
+		compare_signatures(&prim_hitmask[i], &sec_hitmask[i],
+				primary_bkt[i], secondary_bkt[i],
+				prim_hash[i], sec_hash[i], h->sig_cmp_fn);
+
+		if (prim_hitmask[i]) {
+			uint32_t first_hit = __builtin_ctzl(prim_hitmask[i]);
+			uint32_t key_idx = primary_bkt[i]->key_idx[first_hit];
+			const struct rte_hash_key *key_slot =
+				(const struct rte_hash_key *)(
+				(const char *)h->key_store +
+				key_idx * h->key_entry_size);
+			rte_prefetch0(key_slot);
+			continue;
+		}
+
+		if (sec_hitmask[i]) {
+			uint32_t first_hit = __builtin_ctzl(sec_hitmask[i]);
+			uint32_t key_idx = secondary_bkt[i]->key_idx[first_hit];
+			const struct rte_hash_key *key_slot =
+				(const struct rte_hash_key *)(
+				(const char *)h->key_store +
+				key_idx * h->key_entry_size);
+			rte_prefetch0(key_slot);
+		}
+	}
+
+	/* Compare keys, first hits in primary first */
+	for (i = 0; i < num_keys; i++) {
+		positions[i] = -ENOENT;
+		while (prim_hitmask[i]) {
+			uint32_t hit_index = __builtin_ctzl(prim_hitmask[i]);
+
+			uint32_t key_idx = primary_bkt[i]->key_idx[hit_index];
+			const struct rte_hash_key *key_slot =
+				(const struct rte_hash_key *)(
+				(const char *)h->key_store +
+				key_idx * h->key_entry_size);
+			/*
+			 * If key index is 0, do not compare key,
+			 * as it is checking the dummy slot
+			 */
+			if (!!key_idx & !rte_hash_cmp_eq(key_slot->key, keys[i], h)) {
+				if (data != NULL)
+					data[i] = key_slot->pdata;
+
+				hits |= 1ULL << i;
+				positions[i] = key_idx - 1;
+				goto next_key;
+			}
+			prim_hitmask[i] &= ~(1 << (hit_index));
+		}
+
+		while (sec_hitmask[i]) {
+			uint32_t hit_index = __builtin_ctzl(sec_hitmask[i]);
+
+			uint32_t key_idx = secondary_bkt[i]->key_idx[hit_index];
+			const struct rte_hash_key *key_slot =
+				(const struct rte_hash_key *)(
+				(const char *)h->key_store +
+				key_idx * h->key_entry_size);
+			/*
+			 * If key index is 0, do not compare key,
+			 * as it is checking the dummy slot
+			 */
+			if (!!key_idx & !rte_hash_cmp_eq(key_slot->key, keys[i], h)) {
+				if (data != NULL)
+					data[i] = key_slot->pdata;
+
+				hits |= 1ULL << i;
+				positions[i] = key_idx - 1;
+				goto next_key;
+			}
+			sec_hitmask[i] &= ~(1 << (hit_index));
+		}
+next_key:
+		continue;
+	}
+
+	if (hit_mask != NULL)
+		*hit_mask = hits;
+}
+
+int
+rte_hash_lookup_with_hash_bulk(const struct rte_hash *h, const void **keys,
+			uint32_t num_keys, int32_t *positions, hash_sig_t *sigs)
+{
+	RETURN_IF_TRUE(((h == NULL) || (keys == NULL) || (num_keys == 0) ||
+			(num_keys > RTE_HASH_LOOKUP_BULK_MAX) ||
+			(positions == NULL)), -EINVAL);
+
+	__rte_hash_lookup_with_hash_bulk(h, keys, num_keys, positions, sigs,
+			NULL, NULL);
+	return 0;
+}
+
+
+int
+rte_hash_lookup_with_hash_bulk_data(const struct rte_hash *h, const void **keys,
+			uint32_t num_keys, int32_t *positions, hash_sig_t *sigs,
+			uint64_t *hit_mask, void *data[])
+{
+	RETURN_IF_TRUE(((h == NULL) || (keys == NULL) || (num_keys == 0) ||
+			(num_keys > RTE_HASH_LOOKUP_BULK_MAX) ||
+			(positions == NULL)), -EINVAL);
+
+	__rte_hash_lookup_with_hash_bulk(h, keys, num_keys, positions, sigs,
+			hit_mask, data);
+	return 0;
+}
+
+
 int32_t
 rte_hash_iterate(const struct rte_hash *h, const void **key, void **data, uint32_t *next)
 {
