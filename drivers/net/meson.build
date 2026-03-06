@@ -6,6 +6,7 @@ drivers = [
         'af_packet',
         'af_xdp',
         'ark',
+        'dcp',
         'atlantic',
         'avp',
         'axgbe',
