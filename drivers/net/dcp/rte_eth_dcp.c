@@ -12,8 +12,8 @@
  * pages.  The PMD polls this ring in rx_burst.
  *
  * Host->Device (DPDK TX): the PMD writes InRef commands (1 credit header)
- * into the device's RX data queue region in BAR2.  The referenced packet
- * data lives in a host-side DMA buffer; the device DMA-reads it.
+ * into the device's RX data queue region in BAR2. The referenced packet
+ * data lives in the source mbuf; the device DMA-reads it directly.
  */
 
 #include <stdint.h>
@@ -45,8 +45,20 @@ RTE_LOG_REGISTER_DEFAULT(dcp_logtype, NOTICE);
 #define DCP_MAX_NUM_TX_QUEUES   2
 
 #define DCP_CORE_QUEUE_DEPTH    1024
+#define DCP_RX_SW_QUEUE_DEPTH   4096
+#define DCP_CORE_MAX_CREDITS    4096
 #define DCP_CORE_MSS            16
 #define DCP_CORE_MAX_REF_SIZE   512
+
+#if (DCP_CORE_QUEUE_DEPTH == 0) || \
+	((DCP_CORE_QUEUE_DEPTH & (DCP_CORE_QUEUE_DEPTH - 1)) != 0)
+#error "DCP_CORE_QUEUE_DEPTH must be a power of two"
+#endif
+
+#if (DCP_RX_SW_QUEUE_DEPTH == 0) || \
+	((DCP_RX_SW_QUEUE_DEPTH & (DCP_RX_SW_QUEUE_DEPTH - 1)) != 0)
+#error "DCP_RX_SW_QUEUE_DEPTH must be a power of two"
+#endif
 
 /* Command types. */
 #define DCP_CMD_EMPTY     0
@@ -89,8 +101,17 @@ RTE_LOG_REGISTER_DEFAULT(dcp_logtype, NOTICE);
 #define DCP_REG_PKTGEN_TX_CYC_HI  0x1544
 #define DCP_REG_PKTGEN_TX_MSG_LO  0x1548
 #define DCP_REG_PKTGEN_TX_MSG_HI  0x154c
+#define DCP_REG_PKTGEN_HIST_OVF   0x1550
+#define DCP_REG_PKTGEN_INVALID_RX 0x1554
 #define DCP_REG_PKTGEN_CUM_LAT_LO 0x155c
 #define DCP_REG_PKTGEN_CUM_LAT_HI 0x1560
+#define DCP_REG_PKTGEN_COUNT_CHECK 0x1564
+#define DCP_REG_RX_LOCAL_BUF_LO   0x1600
+#define DCP_REG_RX_LOCAL_BUF_HI   0x1604
+#define DCP_REG_RX_REMOTE_BUF_LO  0x1608
+#define DCP_REG_RX_REMOTE_BUF_HI  0x160c
+#define DCP_REG_RX_CONFIG_VALID   0x1618
+#define DCP_REG_RX_CREDITS        0x161c
 #define DCP_REG_HW_MANAGED_BUFS   0x1700
 
 #define DCP_MAX_INLINE_DATA \
@@ -103,12 +124,12 @@ RTE_LOG_REGISTER_DEFAULT(dcp_logtype, NOTICE);
 /*
  * DCP headers are defined as SystemVerilog packed structs with fields
  * laid out from LSB upward.  On the wire each 64-byte credit is a
- * little-endian byte stream: bit 0 → byte 0 bit 0.
+ * little-endian byte stream: bit 0 -> byte 0 bit 0.
  *
- * The first 256 bits (32 bytes) of every credit contain the header;
- * any inline payload data starts at byte 32.
+ * The first 128 bits (16 bytes) of every credit contain the header;
+ * any inline payload data starts at byte 16.
  */
-#define DCP_HEADER_BYTES 32
+#define DCP_HEADER_BYTES 16
 
 static inline uint64_t
 dcp_unpack(const volatile uint8_t *buf, unsigned pos, unsigned width)
@@ -239,7 +260,22 @@ dcp_pack(uint8_t *buf, unsigned pos, uint64_t val, unsigned width)
 /*  Adapter / queue structures                                        */
 /* ------------------------------------------------------------------ */
 
-#define DCP_MAX_BURST 64
+#define DCP_RX_MAX_BURST 64
+#define DCP_MBUF_CACHE_SIZE (2 * DCP_RX_MAX_BURST)
+#define DCP_MAX_GRANTED_RX_BUFS DCP_RX_SW_QUEUE_DEPTH
+#define DCP_MAX_PENDING_CRED_REQS DCP_RX_SW_QUEUE_DEPTH
+
+
+struct dcp_granted_rx_buf {
+	uint64_t data_iova;
+	struct rte_mbuf *mbuf;
+};
+
+struct dcp_pending_cred_req {
+	uint8_t blocking;
+	uint32_t credits;
+	uint64_t sender;
+};
 
 struct dcp_rx_queue {
 	const struct rte_memzone *mz;
@@ -249,16 +285,38 @@ struct dcp_rx_queue {
 	uint32_t          size;
 	uint32_t          freed_creds;
 	struct rte_mempool *mb_pool;
+	uint16_t          mbuf_cache_head;
+	uint16_t          mbuf_cache_count;
+	struct rte_mbuf  *mbuf_cache[DCP_MBUF_CACHE_SIZE];
+	uint16_t          granted_mbuf_head;
+	uint16_t          granted_mbuf_count;
+	struct dcp_granted_rx_buf granted_mbufs[DCP_MAX_GRANTED_RX_BUFS];
+	uint16_t          pending_cred_head;
+	uint16_t          pending_cred_count;
+	struct dcp_pending_cred_req pending_cred_reqs[DCP_MAX_PENDING_CRED_REQS];
 	uint16_t          port_id;
 	uint16_t          queue_id;
 	void             *adapter;
 };
 
 struct dcp_tx_queue {
+	const struct rte_memzone *resp_mz;
+	volatile uint8_t *resp_ring;
+	uint64_t          resp_iova;
+	uint32_t          resp_head;
+	uint32_t          resp_tail;
+	uint32_t          resp_count;
+	uint32_t          resp_size;
 	volatile uint8_t *ring;
 	uint32_t          tail;
 	uint32_t          size;
 	uint32_t          credits;
+	uint32_t          cred_req_thresh;
+	uint32_t          consumed_credits;
+	uint32_t          pending_mbuf_size;
+	struct rte_mbuf **pending_mbufs;
+	uint16_t          pending_mbuf_head;
+	uint16_t          pending_mbuf_count;
 	uint16_t          port_id;
 	uint16_t          queue_id;
 	void             *adapter;
@@ -277,14 +335,6 @@ struct dcp_adapter {
 	uint32_t   alloc_size;
 	uint32_t   alloc_tail;
 	uint32_t   alloc_head;
-
-	/* TX DMA buffer: host memory where packet data is placed
-	 * for InRef sends.  The device DMA-reads from here. */
-	const struct rte_memzone *tx_buf_mz;
-	uint8_t   *tx_buf_vaddr;
-	uint64_t   tx_buf_iova;
-	uint32_t   tx_buf_size;
-	uint32_t   tx_buf_tail;
 
 	uint16_t   nb_rx_queues;
 	uint16_t   nb_tx_queues;
@@ -310,33 +360,95 @@ dcp_read32(volatile uint32_t *bar0, uint32_t off)
 	return rte_read32((const volatile void *)((uintptr_t)bar0 + off));
 }
 
-/* ------------------------------------------------------------------ */
-/*  Allocator (simple bump ring for InRef buffers)                    */
-/* ------------------------------------------------------------------ */
-
-static uint64_t
-dcp_alloc_buf(struct dcp_adapter *a, uint32_t size_bytes)
+static inline uint64_t
+dcp_read64(volatile uint32_t *bar0, uint32_t lo_off, uint32_t hi_off)
 {
-	uint32_t creds = (size_bytes + DCP_CREDIT_SIZE - 1) / DCP_CREDIT_SIZE;
-	uint32_t ring_creds = a->alloc_size / DCP_CREDIT_SIZE;
-	uint32_t mask = ring_creds - 1;
-	/* Use monotonic head/tail: avail = capacity - in_flight. */
-	uint32_t used  = a->alloc_tail - a->alloc_head;
-	uint32_t avail = ring_creds - used;
+	uint64_t lower = dcp_read32(bar0, lo_off);
+	uint64_t upper = dcp_read32(bar0, hi_off);
 
-	if (creds > avail)
-		return 0;
-
-	uint32_t pos = a->alloc_tail & mask;
-	a->alloc_tail += creds;
-	return a->alloc_iova + (uint64_t)pos * DCP_CREDIT_SIZE;
+	return (upper << 32) | lower;
 }
 
 static void
-dcp_free_alloc(struct dcp_adapter *a, uint32_t size_bytes)
+dcp_log_core_stats(struct dcp_adapter *a, const char *phase,
+		   uint16_t nb_rx_queues, uint16_t nb_tx_queues)
 {
-	uint32_t creds = (size_bytes + DCP_CREDIT_SIZE - 1) / DCP_CREDIT_SIZE;
-	a->alloc_head += creds;
+	DCP_LOG(NOTICE, "%s core stats: dma=%u funnel=%u hw_managed_bufs=%u\n",
+		phase,
+		dcp_read32(a->bar0, DCP_REG_DMA_ENABLE),
+		dcp_read32(a->bar0, DCP_REG_FUNNEL),
+		dcp_read32(a->bar0, DCP_REG_HW_MANAGED_BUFS));
+	DCP_LOG(NOTICE, "%s RX cmd=%u invalid=%u\n",
+		phase,
+		dcp_read32(a->bar0, 0x1200),
+		dcp_read32(a->bar0, 0x1210));
+
+	for (uint16_t q = 0; q < nb_rx_queues; q++) {
+		DCP_LOG(NOTICE, "%s RX queue %u flits=%u\n",
+			phase, q, dcp_read32(a->bar0, 0x1300 + (q * 4)));
+	}
+
+	for (uint16_t q = 0; q < nb_tx_queues; q++) {
+		dcp_write32(a->bar0, 0x1400, q);
+		(void)dcp_read32(a->bar0, 0x1400);
+		DCP_LOG(NOTICE,
+			"%s TX queue %u cmd=%u flit=%u avail_credits=%u tail=%u\n",
+			phase, q,
+			dcp_read32(a->bar0, 0x142c),
+			dcp_read32(a->bar0, 0x1430),
+			dcp_read32(a->bar0, 0x1448),
+			dcp_read32(a->bar0, 0x1438));
+	}
+
+	DCP_LOG(NOTICE,
+		"%s RX config: valid=%u local_buf=0x%" PRIx64
+		" remote_buf=0x%" PRIx64 " credits=%u\n",
+		phase,
+		dcp_read32(a->bar0, DCP_REG_RX_CONFIG_VALID),
+		dcp_read64(a->bar0, DCP_REG_RX_LOCAL_BUF_LO, DCP_REG_RX_LOCAL_BUF_HI),
+		dcp_read64(a->bar0, DCP_REG_RX_REMOTE_BUF_LO, DCP_REG_RX_REMOTE_BUF_HI),
+		dcp_read32(a->bar0, DCP_REG_RX_CREDITS));
+}
+
+static void
+dcp_log_pktgen_stats(struct dcp_adapter *a, const char *phase)
+{
+	uint64_t rx_msgs = dcp_read64(a->bar0,
+		DCP_REG_PKTGEN_RX_MSG_LO, DCP_REG_PKTGEN_RX_MSG_HI);
+	uint64_t tx_msgs = dcp_read64(a->bar0,
+		DCP_REG_PKTGEN_TX_MSG_LO, DCP_REG_PKTGEN_TX_MSG_HI);
+	uint64_t rx_cycles = dcp_read64(a->bar0,
+		DCP_REG_PKTGEN_RX_CYC_LO, DCP_REG_PKTGEN_RX_CYC_HI);
+	uint64_t tx_cycles = dcp_read64(a->bar0,
+		DCP_REG_PKTGEN_TX_CYC_LO, DCP_REG_PKTGEN_TX_CYC_HI);
+	uint64_t cum_latency = dcp_read64(a->bar0,
+		DCP_REG_PKTGEN_CUM_LAT_LO, DCP_REG_PKTGEN_CUM_LAT_HI);
+	uint64_t mean_latency_ns = 0;
+
+	if (rx_msgs != 0)
+		mean_latency_ns = (cum_latency / rx_msgs) * 4;
+
+	DCP_LOG(NOTICE,
+		"%s pktgen: run=%u done=%u num_msgs=%" PRIu64
+		" msg_size=%u rate=%u/%u tx_queues=%u timestamp=%u count_check=%u precision=%u\n",
+		phase,
+		dcp_read32(a->bar0, DCP_REG_PKTGEN_RUN),
+		dcp_read32(a->bar0, DCP_REG_PKTGEN_DONE),
+		dcp_read64(a->bar0, DCP_REG_PKTGEN_NUM_LO, DCP_REG_PKTGEN_NUM_HI),
+		dcp_read32(a->bar0, DCP_REG_PKTGEN_SIZE),
+		dcp_read32(a->bar0, DCP_REG_PKTGEN_RATE_NUM),
+		dcp_read32(a->bar0, DCP_REG_PKTGEN_RATE_DEN),
+		dcp_read32(a->bar0, DCP_REG_PKTGEN_QUEUES),
+		dcp_read32(a->bar0, DCP_REG_PKTGEN_TIMESTAMP),
+		dcp_read32(a->bar0, DCP_REG_PKTGEN_COUNT_CHECK),
+		dcp_read32(a->bar0, DCP_REG_PKTGEN_PRECISION));
+	DCP_LOG(NOTICE,
+		"%s pktgen results: tx_msgs=%" PRIu64 " rx_msgs=%" PRIu64
+		" tx_cycles=%" PRIu64 " rx_cycles=%" PRIu64
+		" mean_rtt_ns=%" PRIu64 " hist_overflow=%u invalid_rx=%u\n",
+		phase, tx_msgs, rx_msgs, tx_cycles, rx_cycles, mean_latency_ns,
+		dcp_read32(a->bar0, DCP_REG_PKTGEN_HIST_OVF),
+		dcp_read32(a->bar0, DCP_REG_PKTGEN_INVALID_RX));
 }
 
 /* ------------------------------------------------------------------ */
@@ -424,11 +536,295 @@ dcp_write_resp_to_bar2(struct dcp_adapter *a, uint64_t sender_phys,
 {
 	uint64_t off = sender_phys - a->bar2_phys;
 	volatile uint8_t *dst = a->bar2 + off;
+	// uint8_t buf[DCP_CREDIT_SIZE];
+	// memset(buf, 0, sizeof(buf));
+	// memcpy(buf, resp, sz);
+	rte_memcpy((void *)(uintptr_t)dst, resp, sz);
+	rte_wmb();
+}
+
+static int
+dcp_rxq_refill_mbuf_cache(struct dcp_rx_queue *rxq)
+{
+	struct rte_mbuf *new_mbufs[DCP_RX_MAX_BURST];
+	uint16_t tail;
+
+	if (rxq->mbuf_cache_count >= DCP_RX_MAX_BURST)
+		return 0;
+
+	if (rte_pktmbuf_alloc_bulk(rxq->mb_pool, new_mbufs,
+			DCP_RX_MAX_BURST) != 0)
+		return -ENOMEM;
+
+	tail = (uint16_t)((rxq->mbuf_cache_head + rxq->mbuf_cache_count) %
+		DCP_MBUF_CACHE_SIZE);
+	for (uint16_t i = 0; i < DCP_RX_MAX_BURST; i++)
+		rxq->mbuf_cache[(tail + i) % DCP_MBUF_CACHE_SIZE] = new_mbufs[i];
+
+	rxq->mbuf_cache_count += DCP_RX_MAX_BURST;
+	return 0;
+}
+
+static inline struct rte_mbuf *
+dcp_rxq_get_mbuf(struct dcp_rx_queue *rxq)
+{
+	struct rte_mbuf *m;
+
+	if (rxq->mbuf_cache_count == 0) {
+		DCP_LOG(DEBUG, "mbuf cache empty for port %u queue %u\n",
+			rxq->port_id, rxq->queue_id);
+		return NULL;
+	}
+
+	m = rxq->mbuf_cache[rxq->mbuf_cache_head];
+	rxq->mbuf_cache[rxq->mbuf_cache_head] = NULL;
+	rxq->mbuf_cache_head =
+		(uint16_t)((rxq->mbuf_cache_head + 1) % DCP_MBUF_CACHE_SIZE);
+	rxq->mbuf_cache_count--;
+	return m;
+}
+
+static void
+dcp_rxq_free_mbuf_cache(struct dcp_rx_queue *rxq)
+{
+	while (rxq->mbuf_cache_count > 0) {
+		struct rte_mbuf *m = rxq->mbuf_cache[rxq->mbuf_cache_head];
+
+		rxq->mbuf_cache[rxq->mbuf_cache_head] = NULL;
+		rxq->mbuf_cache_head =
+			(uint16_t)((rxq->mbuf_cache_head + 1) % DCP_MBUF_CACHE_SIZE);
+		rxq->mbuf_cache_count--;
+		if (m != NULL)
+			rte_pktmbuf_free(m);
+	}
+}
+
+static inline uintptr_t *
+dcp_mbuf_cookie_ptr(struct rte_mbuf *m)
+{
+	return (uintptr_t *)((uint8_t *)rte_pktmbuf_mtod(m, void *) -
+		sizeof(uintptr_t));
+}
+
+static int
+dcp_rxq_grant_mbuf(struct dcp_rx_queue *rxq, struct rte_mbuf *m)
+{
+	uint16_t tail;
+	uint64_t data_iova;
+
+	if (rxq->granted_mbuf_count >= DCP_MAX_GRANTED_RX_BUFS)
+		return -ENOSPC;
+
+	data_iova = rte_mbuf_data_iova_default(m);
+	*dcp_mbuf_cookie_ptr(m) = (uintptr_t)m;
+	tail = (uint16_t)((rxq->granted_mbuf_head + rxq->granted_mbuf_count) %
+		DCP_MAX_GRANTED_RX_BUFS);
+	rxq->granted_mbufs[tail].mbuf = m;
+	rxq->granted_mbufs[tail].data_iova = data_iova;
+	rxq->granted_mbuf_count++;
+	return 0;
+}
+
+static struct rte_mbuf *
+dcp_rxq_take_granted_mbuf(struct dcp_rx_queue *rxq, uint64_t data_iova)
+{
+	struct rte_mbuf *m;
+
+	if (rxq->granted_mbuf_count == 0)
+		return NULL;
+
+	if (rxq->granted_mbufs[rxq->granted_mbuf_head].data_iova != data_iova)
+		return NULL;
+
+	m = rxq->granted_mbufs[rxq->granted_mbuf_head].mbuf;
+	rxq->granted_mbufs[rxq->granted_mbuf_head].mbuf = NULL;
+	rxq->granted_mbufs[rxq->granted_mbuf_head].data_iova = 0;
+	rxq->granted_mbuf_head =
+		(uint16_t)((rxq->granted_mbuf_head + 1) % DCP_MAX_GRANTED_RX_BUFS);
+	rxq->granted_mbuf_count--;
+	return m;
+}
+
+static inline struct rte_mbuf *
+dcp_rxq_mbuf_from_data_addr(uint64_t data_addr)
+{
+	uintptr_t *cookie = (uintptr_t *)((uint8_t *)(uintptr_t)data_addr -
+		sizeof(uintptr_t));
+
+	return (struct rte_mbuf *)*cookie;
+}
+
+static void
+dcp_rxq_free_granted_mbufs(struct dcp_rx_queue *rxq)
+{
+	while (rxq->granted_mbuf_count > 0) {
+		struct rte_mbuf *m = rxq->granted_mbufs[rxq->granted_mbuf_head].mbuf;
+
+		rxq->granted_mbufs[rxq->granted_mbuf_head].mbuf = NULL;
+		rxq->granted_mbufs[rxq->granted_mbuf_head].data_iova = 0;
+		rxq->granted_mbuf_head =
+			(uint16_t)((rxq->granted_mbuf_head + 1) % DCP_MAX_GRANTED_RX_BUFS);
+		rxq->granted_mbuf_count--;
+		if (m != NULL)
+			rte_pktmbuf_free(m);
+	}
+}
+
+static int
+dcp_rxq_enqueue_pending_cred_req(struct dcp_rx_queue *rxq, bool blocking,
+		uint32_t credits, uint64_t sender)
+{
+	uint16_t tail;
+
+	if (rxq->pending_cred_count >= DCP_MAX_PENDING_CRED_REQS)
+		return -ENOSPC;
+
+	tail = (uint16_t)((rxq->pending_cred_head + rxq->pending_cred_count) %
+		DCP_MAX_PENDING_CRED_REQS);
+	rxq->pending_cred_reqs[tail].blocking = blocking ? 1 : 0;
+	rxq->pending_cred_reqs[tail].credits = credits;
+	rxq->pending_cred_reqs[tail].sender = sender;
+	rxq->pending_cred_count++;
+	return 0;
+}
+
+static void
+dcp_rxq_process_pending_cred_reqs(struct dcp_rx_queue *rxq,
+		struct dcp_adapter *a)
+{
+	uint32_t available = rxq->freed_creds;
+
+	while (rxq->pending_cred_count > 0) {
+		struct dcp_pending_cred_req *req =
+			&rxq->pending_cred_reqs[rxq->pending_cred_head];
+		uint32_t requested = req->credits + req->blocking;
+		uint32_t granted = RTE_MIN(available, requested);
+
+		if (req->blocking != 0 && granted < requested)
+			break;
+
+		available -= granted;
+		granted -= req->blocking;
+
+		uint8_t resp[DCP_CREDIT_SIZE];
+		memset(resp, 0, sizeof(resp));
+		dcp_pack(resp, BP_CMD_TYPE, DCP_CMD_RESP, BW_CMD_TYPE);
+		dcp_pack(resp, BP_RCR_RTYPE, DCP_RESP_CRED_REQ,
+			 BW_RCR_RTYPE);
+		dcp_pack(resp, BP_RCR_NCREDS, granted, BW_RCR_NCREDS);
+		dcp_write_resp_to_bar2(a, req->sender,
+				       resp, sizeof(resp));
+
+		req->blocking = 0;
+		req->credits = 0;
+		req->sender = 0;
+		rxq->pending_cred_head = (uint16_t)((rxq->pending_cred_head + 1) %
+			DCP_MAX_PENDING_CRED_REQS);
+		rxq->pending_cred_count--;
+	}
+
+	rxq->freed_creds = available;
+}
+
+static void
+dcp_txq_free_returned_mbufs(struct dcp_tx_queue *txq, uint32_t num_bufs)
+{
+	while (num_bufs > 0 && txq->pending_mbuf_count > 0) {
+		struct rte_mbuf *m = txq->pending_mbufs[txq->pending_mbuf_head];
+
+		txq->pending_mbufs[txq->pending_mbuf_head] = NULL;
+		txq->pending_mbuf_head = (uint16_t)((txq->pending_mbuf_head + 1) %
+			txq->pending_mbuf_size);
+		txq->pending_mbuf_count--;
+		if (m != NULL)
+			rte_pktmbuf_free(m);
+		num_bufs--;
+	}
+}
+
+static int
+dcp_txq_enqueue_pending_mbuf(struct dcp_tx_queue *txq, struct rte_mbuf *m)
+{
+	uint16_t tail;
+
+	if (txq->pending_mbuf_count >= txq->pending_mbuf_size)
+		return -ENOSPC;
+
+	tail = (uint16_t)((txq->pending_mbuf_head + txq->pending_mbuf_count) %
+		txq->pending_mbuf_size);
+	txq->pending_mbufs[tail] = m;
+	txq->pending_mbuf_count++;
+	return 0;
+}
+
+static void
+dcp_txq_process_completions(struct dcp_tx_queue *txq)
+{
+	while (txq->resp_count > 0) {
+		volatile uint8_t *slot = txq->resp_ring +
+			(uint64_t)txq->resp_head * DCP_CREDIT_SIZE;
+		uint8_t ct = (uint8_t)dcp_unpack(slot, BP_CMD_TYPE, BW_CMD_TYPE);
+
+		if (ct == DCP_CMD_EMPTY)
+			break;
+
+		if (ct == DCP_CMD_RESP &&
+		    dcp_unpack(slot, BP_RCR_RTYPE, BW_RCR_RTYPE) ==
+		    DCP_RESP_CRED_REQ) {
+			uint32_t returned_credits = (uint32_t)dcp_unpack(slot,
+					BP_RCR_NCREDS, BW_RCR_NCREDS);
+
+			txq->credits += returned_credits + 1;
+			if (txq->consumed_credits > 0)
+				txq->consumed_credits--;
+			dcp_txq_free_returned_mbufs(txq, returned_credits);
+		} else {
+			DCP_LOG(ERR, "Unexpected TX completion cmd=%u on port %u queue %u\n",
+				ct, txq->port_id, txq->queue_id);
+		}
+
+		*(volatile uint64_t *)(uintptr_t)slot = 0;
+		txq->resp_head = (txq->resp_head + 1) % txq->resp_size;
+		txq->resp_count--;
+	}
+}
+
+static int
+dcp_txq_request_credits_if_needed(struct dcp_tx_queue *txq)
+{
+	uint64_t sender;
 	uint8_t buf[DCP_CREDIT_SIZE];
+	volatile uint8_t *dst;
+
+	if (txq->consumed_credits <= txq->cred_req_thresh)
+		return 0;
+
+	if (txq->credits <= 1)
+		return -EAGAIN;
+
+	if (txq->resp_count >= txq->resp_size)
+		return -ENOSPC;
+
+	txq->consumed_credits -= txq->cred_req_thresh;
+	sender = txq->resp_iova +
+		(uint64_t)txq->resp_tail * DCP_CREDIT_SIZE;
+
 	memset(buf, 0, sizeof(buf));
-	memcpy(buf, resp, sz);
+	dcp_pack(buf, BP_CMD_TYPE, DCP_CMD_REQ_CRED, BW_CMD_TYPE);
+	dcp_pack(buf, BP_RC_BLOCKING, 1, 1);
+	dcp_pack(buf, BP_RC_NCREDS, txq->cred_req_thresh, BW_RC_NCREDS);
+	dcp_pack(buf, BP_RC_SENDER, sender, BW_RC_SENDER);
+
+	dst = txq->ring + (uint64_t)txq->tail * DCP_CREDIT_SIZE;
 	rte_memcpy((void *)(uintptr_t)dst, buf, DCP_CREDIT_SIZE);
 	rte_wmb();
+
+	txq->tail = (txq->tail + 1) % txq->size;
+	txq->credits--;
+	txq->consumed_credits++;
+	txq->resp_tail = (txq->resp_tail + 1) % txq->resp_size;
+	txq->resp_count++;
+	return 0;
 }
 
 static uint16_t
@@ -440,21 +836,15 @@ eth_dcp_rx(void *rxq_ptr, struct rte_mbuf **pkts, uint16_t nb_pkts)
 	uint32_t processed = 0;
 	uint32_t mask = rxq->size - 1;
 
-	/* One-time dump of first slot for debugging. */
-	static int rx_dump_done[2] = {0, 0};
-	if (rxq->queue_id < 2 && !rx_dump_done[rxq->queue_id]) {
-		rx_dump_done[rxq->queue_id] = 1;
-		volatile uint8_t *s0 = rxq->ring;
-		DCP_LOG(NOTICE, "RX q%u ring=%p iova=0x%lx head=%u first8: "
-			"%02x%02x%02x%02x %02x%02x%02x%02x\n",
-			rxq->queue_id, rxq->ring,
-			(unsigned long)rxq->ring_iova,
-			rxq->head,
-			s0[0], s0[1], s0[2], s0[3],
-			s0[4], s0[5], s0[6], s0[7]);
+	// nb_pkts = (uint16_t)RTE_MIN(nb_pkts, DCP_RX_MAX_BURST);
+
+	if (unlikely(dcp_rxq_refill_mbuf_cache(rxq))) {
+		DCP_LOG(ERR, "Failed to refill mbuf cache\n");
+		return 0;
 	}
 
-	while (nb_rx < nb_pkts) {
+	// while (nb_rx < nb_pkts) {
+	for (uint16_t i = 0; (i < DCP_RX_MAX_BURST) && (nb_rx < nb_pkts); ++i) {
 		volatile uint8_t *slot = rxq->ring +
 			(uint64_t)(rxq->head & mask) * DCP_CREDIT_SIZE;
 		uint8_t ct = (uint8_t)dcp_unpack(slot, BP_CMD_TYPE, BW_CMD_TYPE);
@@ -465,16 +855,19 @@ eth_dcp_rx(void *rxq_ptr, struct rte_mbuf **pkts, uint16_t nb_pkts)
 		if (ct == DCP_CMD_IN_VALUE) {
 			uint32_t sz = (uint32_t)dcp_unpack(slot,
 					BP_IV_SIZE, BW_IV_SIZE);
-			uint32_t ncreds =
-				(DCP_HEADER_BYTES + sz +
-				 DCP_CREDIT_SIZE - 1) / DCP_CREDIT_SIZE;
+			
+			// TODO(sadok): Add support for larger pass by value.
+			// uint32_t ncreds =
+			// 	(DCP_HEADER_BYTES + sz +
+			// 	 DCP_CREDIT_SIZE - 1) / DCP_CREDIT_SIZE;
+			uint32_t ncreds = 1;
 
-			struct rte_mbuf *m = rte_pktmbuf_alloc(rxq->mb_pool);
+			struct rte_mbuf *m = dcp_rxq_get_mbuf(rxq);
 			if (unlikely(!m))
 				break;
 			const uint8_t *src = (const uint8_t *)(uintptr_t)slot +
 				DCP_HEADER_BYTES;
-			memcpy(rte_pktmbuf_mtod(m, void *), src, sz);
+			rte_memcpy(rte_pktmbuf_mtod(m, void *), src, sz);
 			m->data_len = sz;
 			m->pkt_len  = sz;
 			m->port     = rxq->port_id;
@@ -496,35 +889,18 @@ eth_dcp_rx(void *rxq_ptr, struct rte_mbuf **pkts, uint16_t nb_pkts)
 			uint64_t addr = dcp_unpack(slot,
 					BP_IR_ADDR, BW_IR_ADDR);
 
-			struct rte_mbuf *m = rte_pktmbuf_alloc(rxq->mb_pool);
-			if (unlikely(!m))
-				break;
-
-			int valid = 0;
-			if (addr >= a->bar2_phys &&
-			    addr < a->bar2_phys + 0x1000000) {
-				/* HW-managed bufs: data in BAR2 spill. */
-				uint64_t boff = addr - a->bar2_phys;
-				rte_memcpy(rte_pktmbuf_mtod(m, void *),
-				       (void *)(uintptr_t)(a->bar2 + boff),
-				       sz);
-				valid = 1;
-			} else if (addr >= a->alloc_iova &&
-				   addr < a->alloc_iova + a->alloc_size) {
-				/* Non-HW-managed: data in host alloc. */
-				uint64_t roff = addr - a->alloc_iova;
-				memcpy(rte_pktmbuf_mtod(m, void *),
-				       a->alloc_vaddr + roff, sz);
-				dcp_free_alloc(a, sz);
-				valid = 1;
+			struct rte_mbuf *m = dcp_rxq_take_granted_mbuf(rxq, addr);
+			if (m == NULL) {
+				// We didn't grant this buffer, treat it as virtual address.
+				m = dcp_rxq_mbuf_from_data_addr(addr);
 			}
-			if (!valid) {
+			if (unlikely(m == NULL)) {
 				DCP_LOG(ERR, "InRef bad addr=0x%" PRIx64
 					" sz=%u\n", addr, sz);
 				rte_pktmbuf_free(m);
 				*(volatile uint64_t *)(uintptr_t)slot = 0;
-				rxq->head += 1;
-				processed += 1;
+				++(rxq->head);
+				++processed;
 				continue;
 			}
 			m->data_len = sz;
@@ -533,15 +909,34 @@ eth_dcp_rx(void *rxq_ptr, struct rte_mbuf **pkts, uint16_t nb_pkts)
 			pkts[nb_rx++] = m;
 
 			*(volatile uint64_t *)(uintptr_t)slot = 0;
-			rxq->head += 1;
-			processed += 1;
+			++(rxq->head);
+			++processed;
 
 		} else if (ct == DCP_CMD_REQ_BUF) {
 			uint32_t sz     = (uint32_t)dcp_unpack(slot,
 					BP_RB_SIZE, BW_RB_SIZE);
 			uint64_t sender = dcp_unpack(slot,
 					BP_RB_SENDER, BW_RB_SENDER);
-			uint64_t buf_addr = dcp_alloc_buf(a, sz);
+			struct rte_mbuf *m = dcp_rxq_get_mbuf(rxq);
+			uint64_t buf_addr = 0;
+
+			if (m != NULL) {
+				if (likely(sz <= rte_pktmbuf_tailroom(m)) &&
+				    dcp_rxq_grant_mbuf(rxq, m) == 0) {
+					buf_addr = rte_mbuf_data_iova_default(m);
+				} else {
+					DCP_LOG(NOTICE, "freeing mbuf for ReqBuf sz=%u sender=0x%" PRIx64 "\n",
+						sz, sender);
+					rte_pktmbuf_free(m);
+				}
+			} else {
+				DCP_LOG(NOTICE, "no mbuf for ReqBuf sz=%u sender=0x%" PRIx64 "\n",
+					sz, sender);
+			}
+			if (buf_addr == 0) {
+				DCP_LOG(NOTICE, "buf_addr is NULL for ReqBuf sz=%u sender=0x%" PRIx64 "\n",
+					sz, sender);
+			}
 
 			uint8_t resp[DCP_CREDIT_SIZE];
 			memset(resp, 0, sizeof(resp));
@@ -556,37 +951,36 @@ eth_dcp_rx(void *rxq_ptr, struct rte_mbuf **pkts, uint16_t nb_pkts)
 					       resp, sizeof(resp));
 
 			*(volatile uint64_t *)(uintptr_t)slot = 0;
-			rxq->head += 1;
-			processed += 1;
+			++(rxq->head);
+			++processed;
 
 		} else if (ct == DCP_CMD_REQ_CRED) {
+			uint32_t requested = (uint32_t)dcp_unpack(slot,
+					BP_RC_NCREDS, BW_RC_NCREDS);
+			bool blocking = dcp_unpack(slot,
+					BP_RC_BLOCKING, 1) != 0;
 			uint64_t sender = dcp_unpack(slot,
 					BP_RC_SENDER, BW_RC_SENDER);
-			uint32_t avail  = processed + rxq->freed_creds;
-			rxq->freed_creds = 0;
-			processed = 0;
 
-			uint8_t resp[DCP_CREDIT_SIZE];
-			memset(resp, 0, sizeof(resp));
-			dcp_pack(resp, BP_CMD_TYPE, DCP_CMD_RESP, BW_CMD_TYPE);
-			dcp_pack(resp, BP_RCR_RTYPE, DCP_RESP_CRED_REQ,
-				 BW_RCR_RTYPE);
-			dcp_pack(resp, BP_RCR_NCREDS, avail, BW_RCR_NCREDS);
-			dcp_write_resp_to_bar2(a, sender,
-					       resp, sizeof(resp));
+			if (unlikely(dcp_rxq_enqueue_pending_cred_req(rxq, blocking,
+					requested, sender) != 0)) {
+				DCP_LOG(ERR, "Pending ReqCred ring full\n");
+				break;
+			}
 
 			*(volatile uint64_t *)(uintptr_t)slot = 0;
-			rxq->head += 1;
-			processed += 1;
+			++(rxq->head);
+			++processed;
 
 		} else {
 			*(volatile uint64_t *)(uintptr_t)slot = 0;
-			rxq->head += 1;
-			processed += 1;
+			++(rxq->head);
+			++processed;
 		}
 	}
 
 	rxq->freed_creds += processed;
+	dcp_rxq_process_pending_cred_reqs(rxq, a);
 	return nb_rx;
 }
 
@@ -598,28 +992,38 @@ static uint16_t
 eth_dcp_tx(void *txq_ptr, struct rte_mbuf **pkts, uint16_t nb_pkts)
 {
 	struct dcp_tx_queue *txq = txq_ptr;
-	struct dcp_adapter *a = txq->adapter;
 	uint16_t nb_tx = 0;
-	uint32_t mask = txq->size - 1;
+
+	dcp_txq_process_completions(txq);
 
 	for (uint16_t i = 0; i < nb_pkts; i++) {
 		struct rte_mbuf *m = pkts[i];
 		uint32_t pkt_len = m->pkt_len;
+		uint64_t data_iova;
+		int ret;
 
-		/* Each InRef command costs exactly 1 credit. */
-		if (txq->credits < 1)
+		dcp_txq_process_completions(txq);
+		ret = dcp_txq_request_credits_if_needed(txq);
+		if (unlikely(ret != 0 && ret != -EAGAIN)) {
+			DCP_LOG(ERR, "Failed to request TX credits on port %u queue %u: %d\n",
+				txq->port_id, txq->queue_id, ret);
+			break;
+		}
+
+		/* Keep one credit reserved so a blocking ReqCred can still be sent. */
+		if (txq->credits <= 1)
 			break;
 
-		/* Copy packet data to the TX DMA buffer so the device
-		 * can DMA-read it after we write the InRef header. */
-		uint32_t align_len = RTE_ALIGN_CEIL(pkt_len, DCP_CREDIT_SIZE);
-		if (a->tx_buf_tail + align_len > a->tx_buf_size)
-			break; /* out of TX buffer space */
+		if (unlikely(!rte_pktmbuf_is_contiguous(m)))
+			break;
 
-		memcpy(a->tx_buf_vaddr + a->tx_buf_tail,
-		       rte_pktmbuf_mtod(m, void *), pkt_len);
-		uint64_t data_iova = a->tx_buf_iova + a->tx_buf_tail;
-		a->tx_buf_tail += align_len;
+		if (unlikely(dcp_txq_enqueue_pending_mbuf(txq, m) != 0)) {
+			DCP_LOG(ERR, "TX pending mbuf ring full on port %u queue %u\n",
+				txq->port_id, txq->queue_id);
+			break;
+		}
+
+		data_iova = rte_mbuf_data_iova_default(m);
 
 		/* Build InRef header (fits in 1 credit). */
 		uint8_t buf[DCP_CREDIT_SIZE];
@@ -630,26 +1034,25 @@ eth_dcp_tx(void *txq_ptr, struct rte_mbuf **pkts, uint16_t nb_pkts)
 		dcp_pack(buf, BP_IR_SENDER, 0, BW_IR_SENDER);
 		dcp_pack(buf, BP_IR_ADDR, data_iova, BW_IR_ADDR);
 
-		/* Compiler barrier: ensure the DMA data buffer stores
-		 * are emitted before the BAR2 command write. */
+		/* Ensure packet data is visible before the BAR2 command write. */
 		rte_compiler_barrier();
 
 		/* Write 1 credit to BAR2 (write-combined region). */
-		uint32_t pos = txq->tail & mask;
 		volatile uint8_t *dst = txq->ring +
-			(uint64_t)pos * DCP_CREDIT_SIZE;
+			(uint64_t)txq->tail * DCP_CREDIT_SIZE;
 		rte_memcpy((void *)(uintptr_t)dst, buf, DCP_CREDIT_SIZE);
 
 		/* Flush the write-combining buffer so the device sees
 		 * the InRef command. */
 		rte_wmb();
 
-		txq->tail    += 1;
+		txq->tail = (txq->tail + 1) % txq->size;
 		txq->credits -= 1;
+		txq->consumed_credits += 1;
 		nb_tx++;
-
-		rte_pktmbuf_free(m);
 	}
+
+	dcp_txq_process_completions(txq);
 
 	return nb_tx;
 }
@@ -678,7 +1081,7 @@ eth_dcp_rx_queue_setup(struct rte_eth_dev *dev, uint16_t qid,
 	if (!rxq)
 		return -ENOMEM;
 
-	uint32_t ring_bytes = (uint32_t)a->queue_depth * DCP_CREDIT_SIZE;
+	uint32_t ring_bytes = DCP_RX_SW_QUEUE_DEPTH * DCP_CREDIT_SIZE;
 	char name[RTE_MEMZONE_NAMESIZE];
 	snprintf(name, sizeof(name), "dcp_rx_%u_%u",
 		 dev->data->port_id, qid);
@@ -694,9 +1097,15 @@ eth_dcp_rx_queue_setup(struct rte_eth_dev *dev, uint16_t qid,
 	memset(rxq->mz->addr, 0, ring_bytes);
 	rxq->ring        = rxq->mz->addr;
 	rxq->ring_iova   = rxq->mz->iova;
-	rxq->size        = a->queue_depth;
+	rxq->size        = DCP_RX_SW_QUEUE_DEPTH;
 	rxq->head        = 0;
 	rxq->freed_creds = 0;
+	rxq->mbuf_cache_head = 0;
+	rxq->mbuf_cache_count = 0;
+	rxq->granted_mbuf_head = 0;
+	rxq->granted_mbuf_count = 0;
+	rxq->pending_cred_head = 0;
+	rxq->pending_cred_count = 0;
 	rxq->mb_pool     = mb_pool;
 	rxq->port_id     = dev->data->port_id;
 	rxq->queue_id    = qid;
@@ -722,10 +1131,42 @@ eth_dcp_tx_queue_setup(struct rte_eth_dev *dev, uint16_t qid,
 
 	/* Device RX data queue = qid + 1 (queue 0 is cfg). */
 	uint64_t off = (uint64_t)(qid + 1) * a->queue_depth * DCP_CREDIT_SIZE;
+	char name[RTE_MEMZONE_NAMESIZE];
+	uint32_t ring_bytes = (uint32_t)a->queue_depth * DCP_CREDIT_SIZE;
 	txq->ring     = a->bar2 + off;
 	txq->tail     = 0;
 	txq->size     = a->queue_depth;
-	txq->credits  = a->queue_depth - 1;
+	txq->credits  = DCP_CORE_MAX_CREDITS;
+	txq->cred_req_thresh = txq->credits / 2;
+	txq->consumed_credits = 0;
+	txq->pending_mbuf_size = txq->credits;
+	txq->pending_mbuf_head = 0;
+	txq->pending_mbuf_count = 0;
+	txq->resp_head = 0;
+	txq->resp_tail = 0;
+	txq->resp_count = 0;
+	txq->resp_size = a->queue_depth;
+	snprintf(name, sizeof(name), "dcp_tx_resp_%u_%u",
+		 dev->data->port_id, qid);
+	txq->resp_mz = rte_memzone_reserve_aligned(name, ring_bytes,
+					       SOCKET_ID_ANY,
+					       0,
+					       RTE_CACHE_LINE_SIZE);
+	if (!txq->resp_mz) {
+		rte_free(txq);
+		return -ENOMEM;
+	}
+	memset(txq->resp_mz->addr, 0, ring_bytes);
+	txq->resp_ring = (volatile uint8_t *)txq->resp_mz->addr;
+	txq->resp_iova = txq->resp_mz->iova;
+	txq->pending_mbufs = (struct rte_mbuf **)rte_zmalloc(NULL,
+		sizeof(*txq->pending_mbufs) * txq->pending_mbuf_size,
+		RTE_CACHE_LINE_SIZE);
+	if (!txq->pending_mbufs) {
+		rte_memzone_free(txq->resp_mz);
+		rte_free(txq);
+		return -ENOMEM;
+	}
 	txq->port_id  = dev->data->port_id;
 	txq->queue_id = qid;
 	txq->adapter  = a;
@@ -740,6 +1181,8 @@ eth_dcp_rx_queue_release(struct rte_eth_dev *dev, uint16_t qid)
 {
 	struct dcp_rx_queue *rxq = dev->data->rx_queues[qid];
 	if (rxq) {
+		dcp_rxq_free_granted_mbufs(rxq);
+		dcp_rxq_free_mbuf_cache(rxq);
 		if (rxq->mz)
 			rte_memzone_free(rxq->mz);
 		rte_free(rxq);
@@ -752,6 +1195,16 @@ eth_dcp_tx_queue_release(struct rte_eth_dev *dev, uint16_t qid)
 {
 	struct dcp_tx_queue *txq = dev->data->tx_queues[qid];
 	if (txq) {
+		dcp_txq_process_completions(txq);
+		if (txq->pending_mbufs != NULL) {
+			for (uint32_t i = 0; i < txq->pending_mbuf_size; i++) {
+				if (txq->pending_mbufs[i] != NULL)
+					rte_pktmbuf_free(txq->pending_mbufs[i]);
+			}
+			rte_free(txq->pending_mbufs);
+		}
+		if (txq->resp_mz)
+			rte_memzone_free(txq->resp_mz);
 		rte_free(txq);
 		dev->data->tx_queues[qid] = NULL;
 	}
@@ -765,6 +1218,9 @@ eth_dcp_dev_start(struct rte_eth_dev *dev)
 
 	DCP_LOG(NOTICE, "dev_start: nrx=%u ntx=%u\n",
 		nrx, dev->data->nb_tx_queues);
+	dcp_log_core_stats(a, "before run", dev->data->nb_rx_queues,
+		dev->data->nb_tx_queues);
+	dcp_log_pktgen_stats(a, "before run");
 
 	/* ---- Phase 1: Reset device to clean state. ---- */
 
@@ -824,27 +1280,8 @@ eth_dcp_dev_start(struct rte_eth_dev *dev)
 		a->alloc_head  = 0;
 	}
 
-	/* Allocate TX DMA buffer for InRef sends (host -> device). */
-	if (!a->tx_buf_mz) {
-		char name[RTE_MEMZONE_NAMESIZE];
-		uint32_t tx_bytes = 2u * 1024 * 1024;
-		snprintf(name, sizeof(name), "dcp_txbuf_%u",
-			 dev->data->port_id);
-		a->tx_buf_mz = rte_memzone_reserve_aligned(name,
-			tx_bytes, SOCKET_ID_ANY,
-			0, RTE_CACHE_LINE_SIZE);
-		if (!a->tx_buf_mz) {
-			DCP_LOG(ERR, "tx_buf_mz reserve failed\n");
-			return -ENOMEM;
-		}
-		a->tx_buf_vaddr = a->tx_buf_mz->addr;
-		a->tx_buf_iova  = a->tx_buf_mz->iova;
-		a->tx_buf_size  = tx_bytes;
-		a->tx_buf_tail  = 0;
-	}
-
-	DCP_LOG(NOTICE, "alloc_mz iova=0x%" PRIx64 " tx_buf iova=0x%" PRIx64 "\n",
-		a->alloc_iova, a->tx_buf_iova);
+	DCP_LOG(NOTICE, "alloc_mz iova=0x%" PRIx64 "\n",
+		a->alloc_iova);
 
 	/* ---- Phase 4: Configure queues (CfgTx then CfgRx). ---- */
 
@@ -877,12 +1314,12 @@ eth_dcp_dev_start(struct rte_eth_dev *dev)
 
 	/* CfgRx: tell device about our allocator region. */
 	dcp_send_cfg_rx(a, dev_buf_phys, a->alloc_iova,
-			a->alloc_size, a->queue_depth - 1);
+			a->alloc_size, 0);
 
 	DCP_LOG(NOTICE, "CfgRx dev_buf=0x%" PRIx64 " remote=0x%" PRIx64
 		" len=0x%x credits=%u\n",
 		dev_buf_phys, a->alloc_iova, a->alloc_size,
-		a->queue_depth - 1);
+		0);
 
 	dev->data->dev_link.link_status = RTE_ETH_LINK_UP;
 	dev->data->dev_link.link_speed  = RTE_ETH_SPEED_NUM_100G;
@@ -894,6 +1331,9 @@ static int
 eth_dcp_dev_stop(struct rte_eth_dev *dev)
 {
 	struct dcp_adapter *a = dev->data->dev_private;
+	dcp_log_core_stats(a, "after run", dev->data->nb_rx_queues,
+		dev->data->nb_tx_queues);
+	dcp_log_pktgen_stats(a, "after run");
 	dcp_write32(a->bar0, DCP_REG_DMA_ENABLE, 0);
 	dev->data->dev_link.link_status = RTE_ETH_LINK_DOWN;
 	return 0;
@@ -906,10 +1346,6 @@ eth_dcp_dev_close(struct rte_eth_dev *dev)
 	if (a->alloc_mz) {
 		rte_memzone_free(a->alloc_mz);
 		a->alloc_mz = NULL;
-	}
-	if (a->tx_buf_mz) {
-		rte_memzone_free(a->tx_buf_mz);
-		a->tx_buf_mz = NULL;
 	}
 	return 0;
 }
