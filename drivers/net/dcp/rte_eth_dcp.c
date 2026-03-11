@@ -371,8 +371,11 @@ dcp_read64(volatile uint32_t *bar0, uint32_t lo_off, uint32_t hi_off)
 
 static void
 dcp_log_core_stats(struct dcp_adapter *a, const char *phase,
-		   uint16_t nb_rx_queues, uint16_t nb_tx_queues)
+		   uint16_t nb_rx_queues __rte_unused, uint16_t nb_tx_queues)
 {
+	uint16_t hw_rx_queues = RTE_MIN((uint16_t)DCP_MAX_NUM_RX_QUEUES,
+		(uint16_t)(nb_tx_queues + 1));
+
 	DCP_LOG(NOTICE, "%s core stats: dma=%u funnel=%u hw_managed_bufs=%u\n",
 		phase,
 		dcp_read32(a->bar0, DCP_REG_DMA_ENABLE),
@@ -383,21 +386,42 @@ dcp_log_core_stats(struct dcp_adapter *a, const char *phase,
 		dcp_read32(a->bar0, 0x1200),
 		dcp_read32(a->bar0, 0x1210));
 
-	for (uint16_t q = 0; q < nb_rx_queues; q++) {
-		DCP_LOG(NOTICE, "%s RX queue %u flits=%u\n",
-			phase, q, dcp_read32(a->bar0, 0x1300 + (q * 4)));
+	for (uint16_t q = 0; q < hw_rx_queues; q++) {
+		if (q == 0) {
+			DCP_LOG(NOTICE,
+				"%s HW RX queue %u (cfg/control) flits=%u\n",
+				phase, q, dcp_read32(a->bar0, 0x1300 + (q * 4)));
+		} else {
+			DCP_LOG(NOTICE,
+				"%s HW RX queue %u (DPDK TX queue %u) flits=%u\n",
+				phase, q, q - 1,
+				dcp_read32(a->bar0, 0x1300 + (q * 4)));
+		}
 	}
 
 	for (uint16_t q = 0; q < nb_tx_queues; q++) {
+		uint32_t cfg_id_tail;
+		uint32_t max_ref_size;
+		uint32_t avail_credits;
+		uint32_t cfg_id;
+		uint32_t tail;
+
 		dcp_write32(a->bar0, 0x1400, q);
 		(void)dcp_read32(a->bar0, 0x1400);
+		cfg_id_tail = dcp_read32(a->bar0, 0x1434);
+		max_ref_size = dcp_read32(a->bar0, 0x1438);
+		avail_credits = dcp_read32(a->bar0, 0x1448) & 0xffffff;
+		cfg_id = cfg_id_tail & 0xf;
+		tail = (cfg_id_tail >> 4) & 0xffffff;
 		DCP_LOG(NOTICE,
-			"%s TX queue %u cmd=%u flit=%u avail_credits=%u tail=%u\n",
+			"%s TX queue %u cmd=%u flit=%u id=%u tail=%u max_ref_size=%u avail_credits=%u\n",
 			phase, q,
 			dcp_read32(a->bar0, 0x142c),
 			dcp_read32(a->bar0, 0x1430),
-			dcp_read32(a->bar0, 0x1448),
-			dcp_read32(a->bar0, 0x1438));
+			cfg_id,
+			tail,
+			max_ref_size,
+			avail_credits);
 	}
 
 	DCP_LOG(NOTICE,
