@@ -799,7 +799,7 @@ dcp_txq_request_credits_if_needed(struct dcp_tx_queue *txq)
 	if (txq->consumed_credits <= txq->cred_req_thresh)
 		return 0;
 
-	if (txq->credits <= 1)
+	if (txq->credits == 0)
 		return -EAGAIN;
 
 	if (txq->resp_count >= txq->resp_size)
@@ -993,6 +993,7 @@ eth_dcp_tx(void *txq_ptr, struct rte_mbuf **pkts, uint16_t nb_pkts)
 {
 	struct dcp_tx_queue *txq = txq_ptr;
 	uint16_t nb_tx = 0;
+	uint32_t tail_mask = txq->size - 1;
 
 	dcp_txq_process_completions(txq);
 
@@ -1000,19 +1001,11 @@ eth_dcp_tx(void *txq_ptr, struct rte_mbuf **pkts, uint16_t nb_pkts)
 		struct rte_mbuf *m = pkts[i];
 		uint32_t pkt_len = m->pkt_len;
 		uint64_t data_iova;
-		int ret;
-
-		dcp_txq_process_completions(txq);
-		ret = dcp_txq_request_credits_if_needed(txq);
-		if (unlikely(ret != 0 && ret != -EAGAIN)) {
-			DCP_LOG(ERR, "Failed to request TX credits on port %u queue %u: %d\n",
-				txq->port_id, txq->queue_id, ret);
-			break;
-		}
 
 		/* Keep one credit reserved so a blocking ReqCred can still be sent. */
-		if (txq->credits <= 1)
+		if (txq->credits <= 1) {
 			break;
+		}
 
 		if (unlikely(!rte_pktmbuf_is_contiguous(m)))
 			break;
@@ -1046,13 +1039,21 @@ eth_dcp_tx(void *txq_ptr, struct rte_mbuf **pkts, uint16_t nb_pkts)
 		 * the InRef command. */
 		rte_wmb();
 
-		txq->tail = (txq->tail + 1) % txq->size;
-		txq->credits -= 1;
-		txq->consumed_credits += 1;
-		nb_tx++;
+		txq->tail = (txq->tail + 1) & tail_mask;
+		--(txq->credits);
+		++(txq->consumed_credits);
+		++nb_tx;
 	}
 
-	dcp_txq_process_completions(txq);
+	int ret = dcp_txq_request_credits_if_needed(txq);
+	if (unlikely(ret != 0)) {
+		DCP_LOG(ERR, "Failed to request TX credits on port %u queue %u: %d\n",
+			txq->port_id, txq->queue_id, ret);
+	}
+
+	/* Flush the write-combining buffer so the device sees
+		* the InRef command. */
+	rte_wmb();
 
 	return nb_tx;
 }
@@ -1137,7 +1138,7 @@ eth_dcp_tx_queue_setup(struct rte_eth_dev *dev, uint16_t qid,
 	txq->tail     = 0;
 	txq->size     = a->queue_depth;
 	txq->credits  = DCP_CORE_MAX_CREDITS;
-	txq->cred_req_thresh = txq->credits / 2;
+	txq->cred_req_thresh = txq->credits / 4;
 	txq->consumed_credits = 0;
 	txq->pending_mbuf_size = txq->credits;
 	txq->pending_mbuf_head = 0;
