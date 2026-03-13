@@ -19,6 +19,11 @@
 #include <stdint.h>
 #include <string.h>
 #include <inttypes.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include <ethdev_driver.h>
 #include <ethdev_pci.h>
@@ -343,6 +348,41 @@ struct dcp_adapter {
 	struct dcp_rx_queue *rxqs[DCP_MAX_NUM_RX_QUEUES];
 	struct dcp_tx_queue *txqs[DCP_MAX_NUM_TX_QUEUES];
 };
+
+static int
+dcp_remap_bar2_wc(struct rte_pci_device *pci)
+{
+	int fd;
+	char devname[PATH_MAX];
+	void *new_map;
+	void *old_map = pci->mem_resource[2].addr;
+	size_t map_len = (size_t)pci->mem_resource[2].len;
+	struct rte_pci_addr *loc = &pci->addr;
+
+	if (old_map == NULL || map_len == 0)
+		return -EINVAL;
+
+	if (munmap(old_map, map_len) != 0) {
+		int err = errno;
+		return -err;
+	}
+
+	snprintf(devname, sizeof(devname), "%s/" PCI_PRI_FMT "/resource2_wc",
+		rte_pci_get_sysfs_path(),
+		loc->domain, loc->bus, loc->devid, loc->function);
+
+	fd = open(devname, O_RDWR);
+	if (fd < 0)
+		return -errno;
+
+	new_map = mmap(NULL, map_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	close(fd);
+	if (new_map == MAP_FAILED)
+		return -errno;
+
+	pci->mem_resource[2].addr = new_map;
+	return 0;
+}
 
 /* ------------------------------------------------------------------ */
 /*  BAR helpers                                                       */
@@ -1432,8 +1472,17 @@ eth_dcp_dev_init(struct rte_eth_dev *dev)
 
 	/* BARs are mapped by DPDK via uio_pci_generic (RTE_PCI_DRV_NEED_MAPPING). */
 	a->bar0      = (volatile uint32_t *)pci->mem_resource[0].addr;
-	a->bar2      = (volatile uint8_t  *)pci->mem_resource[2].addr;
 	a->bar2_phys = pci->mem_resource[2].phys_addr;
+
+	/* Remap BAR2 as write-combining. */
+	int wc_ret = dcp_remap_bar2_wc(pci);
+	if (wc_ret == 0) {
+		a->bar2 = (volatile uint8_t *)pci->mem_resource[2].addr;
+		DCP_LOG(NOTICE, "BAR2 remapped with WC via resource2_wc\n");
+	} else {
+		DCP_LOG(ERR, "BAR2 WC remap unavailable (%d)\n", wc_ret);
+		return -ENODEV;
+	}
 
 	if (!a->bar0 || !a->bar2) {
 		DCP_LOG(ERR, "BAR mapping failed (BAR0=%p BAR2=%p)\n",
