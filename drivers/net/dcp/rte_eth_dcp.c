@@ -16,6 +16,9 @@
  * data lives in the source mbuf; the device DMA-reads it directly.
  */
 
+/* Enable AVX-512 rte_memcpy path (rte_mov64 uses a single zmm load/store). */
+#define RTE_MEMCPY_AVX512
+
 #include <stdint.h>
 #include <string.h>
 #include <inttypes.h>
@@ -24,6 +27,10 @@
 #include <limits.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
 
 #include <ethdev_driver.h>
 #include <ethdev_pci.h>
@@ -261,6 +268,101 @@ dcp_pack(uint8_t *buf, unsigned pos, uint64_t val, unsigned width)
 #define BP_CRX_ICRED    198
 #define BW_CRX_ICRED    24
 
+struct dcp_hdr128 {
+	uint64_t lo;
+	uint64_t hi;
+};
+
+static inline struct dcp_hdr128
+dcp_load_hdr128(const volatile uint8_t *slot)
+{
+	struct dcp_hdr128 hdr;
+
+	__builtin_memcpy(&hdr, (const void *)(uintptr_t)slot, sizeof(hdr));
+	return hdr;
+}
+
+static inline uint64_t
+dcp_hdr128_extract(struct dcp_hdr128 hdr, unsigned pos, unsigned width)
+{
+	__uint128_t acc = ((__uint128_t)hdr.hi << 64) | hdr.lo;
+
+	acc >>= pos;
+	if (width < 64)
+		acc &= (((__uint128_t)1 << width) - 1);
+	return (uint64_t)acc;
+}
+
+static inline uint64_t
+dcp_load64_unaligned(const volatile uint8_t *src)
+{
+	uint64_t val;
+
+	__builtin_memcpy(&val, (const void *)(uintptr_t)src, sizeof(val));
+	return val;
+}
+
+static inline uint8_t
+dcp_cmd_type_fast(const volatile uint8_t *slot)
+{
+	return (uint8_t)slot[0] & ((1u << BW_CMD_TYPE) - 1);
+}
+
+static inline uint32_t
+dcp_in_value_size_fast(struct dcp_hdr128 hdr)
+{
+	return (uint32_t)dcp_hdr128_extract(hdr, BP_IV_SIZE, BW_IV_SIZE);
+}
+
+static inline uint32_t
+dcp_in_ref_size_fast(struct dcp_hdr128 hdr)
+{
+	return (uint32_t)dcp_hdr128_extract(hdr, BP_IR_SIZE, BW_IR_SIZE);
+}
+
+static inline uint64_t
+dcp_in_ref_addr_fast(const volatile uint8_t *slot)
+{
+	const unsigned start_byte = BP_IR_ADDR / 8;
+	const unsigned start_bit = BP_IR_ADDR % 8;
+	uint64_t lower = dcp_load64_unaligned(slot + start_byte);
+	uint8_t upper = (uint8_t)slot[start_byte + sizeof(lower)];
+
+	return (lower >> start_bit) |
+		((uint64_t)(upper & ((1u << start_bit) - 1)) <<
+		 (64 - start_bit));
+}
+
+static inline uint32_t
+dcp_req_buf_size_fast(struct dcp_hdr128 hdr)
+{
+	return (uint32_t)dcp_hdr128_extract(hdr, BP_RB_SIZE, BW_RB_SIZE);
+}
+
+static inline uint64_t
+dcp_req_buf_sender_fast(struct dcp_hdr128 hdr)
+{
+	return dcp_hdr128_extract(hdr, BP_RB_SENDER, BW_RB_SENDER);
+}
+
+static inline uint32_t
+dcp_req_cred_ncreds_fast(struct dcp_hdr128 hdr)
+{
+	return (uint32_t)dcp_hdr128_extract(hdr, BP_RC_NCREDS, BW_RC_NCREDS);
+}
+
+static inline bool
+dcp_req_cred_blocking_fast(struct dcp_hdr128 hdr)
+{
+	return dcp_hdr128_extract(hdr, BP_RC_BLOCKING, 1) != 0;
+}
+
+static inline uint64_t
+dcp_req_cred_sender_fast(struct dcp_hdr128 hdr)
+{
+	return dcp_hdr128_extract(hdr, BP_RC_SENDER, BW_RC_SENDER);
+}
+
 /* ------------------------------------------------------------------ */
 /*  Adapter / queue structures                                        */
 /* ------------------------------------------------------------------ */
@@ -293,6 +395,7 @@ struct dcp_rx_queue {
 	uint16_t          mbuf_cache_head;
 	uint16_t          mbuf_cache_count;
 	struct rte_mbuf  *mbuf_cache[DCP_MBUF_CACHE_SIZE];
+	uint64_t          mbuf_cache_iova[DCP_MBUF_CACHE_SIZE];
 	uint16_t          granted_mbuf_head;
 	uint16_t          granted_mbuf_count;
 	struct dcp_granted_rx_buf granted_mbufs[DCP_MAX_GRANTED_RX_BUFS];
@@ -598,14 +701,46 @@ static inline void
 dcp_write_resp_to_bar2(struct dcp_adapter *a, uint64_t sender_phys,
 		       const void *resp, size_t sz)
 {
+	(void)sz;
 	uint64_t off = sender_phys - a->bar2_phys;
 	volatile uint8_t *dst = a->bar2 + off;
 	// uint8_t buf[DCP_CREDIT_SIZE];
 	// memset(buf, 0, sizeof(buf));
 	// memcpy(buf, resp, sz);
-	rte_memcpy((void *)(uintptr_t)dst, resp, sz);
-	rte_wmb();
+	// rte_memcpy((void *)(uintptr_t)dst, resp, sz);
+	rte_mov64((void *)(uintptr_t)dst, resp);
+	// rte_wmb();
 }
+
+#if defined(__x86_64__) || defined(__i386__)
+static inline __attribute__((target("avx512f"))) __m512i
+dcp_build_resp_buf_req_zmm(uint32_t sz, uint64_t buf_addr)
+{
+	__uint128_t header = 0;
+	__m128i header128;
+	__m512i resp = _mm512_setzero_si512();
+
+	header |= (__uint128_t)DCP_CMD_RESP << BP_CMD_TYPE;
+	header |= (__uint128_t)DCP_RESP_BUF_REQ << BP_RBR_RTYPE;
+	header |= (__uint128_t)(buf_addr != 0) << BP_RBR_SUCCESS;
+	header |= (__uint128_t)sz << BP_RBR_SIZE;
+	header |= (__uint128_t)buf_addr << BP_RBR_ADDR;
+
+	header128 = _mm_set_epi64x((long long)(uint64_t)(header >> 64),
+		(long long)(uint64_t)header);
+	return _mm512_inserti32x4(resp, header128, 0);
+}
+
+static inline __attribute__((target("avx512f"))) void
+dcp_write_resp_zmm_to_bar2(struct dcp_adapter *a, uint64_t sender_phys,
+			   __m512i resp)
+{
+	uint64_t off = sender_phys - a->bar2_phys;
+	volatile uint8_t *dst = a->bar2 + off;
+
+	_mm512_storeu_si512((void *)(uintptr_t)dst, resp);
+}
+#endif
 
 static int
 dcp_rxq_refill_mbuf_cache(struct dcp_rx_queue *rxq)
@@ -622,26 +757,34 @@ dcp_rxq_refill_mbuf_cache(struct dcp_rx_queue *rxq)
 
 	tail = (uint16_t)((rxq->mbuf_cache_head + rxq->mbuf_cache_count) %
 		DCP_MBUF_CACHE_SIZE);
-	for (uint16_t i = 0; i < DCP_RX_MAX_BURST; i++)
+	for (uint16_t i = 0; i < DCP_RX_MAX_BURST; i++) {
 		rxq->mbuf_cache[(tail + i) % DCP_MBUF_CACHE_SIZE] = new_mbufs[i];
+		rxq->mbuf_cache_iova[(tail + i) % DCP_MBUF_CACHE_SIZE] =
+			rte_mbuf_data_iova_default(new_mbufs[i]);
+	}
 
 	rxq->mbuf_cache_count += DCP_RX_MAX_BURST;
 	return 0;
 }
 
 static inline struct rte_mbuf *
-dcp_rxq_get_mbuf(struct dcp_rx_queue *rxq)
+dcp_rxq_get_mbuf(struct dcp_rx_queue *rxq, uint64_t *data_iova)
 {
 	struct rte_mbuf *m;
 
 	if (rxq->mbuf_cache_count == 0) {
+		if (data_iova != NULL)
+			*data_iova = 0;
 		DCP_LOG(DEBUG, "mbuf cache empty for port %u queue %u\n",
 			rxq->port_id, rxq->queue_id);
 		return NULL;
 	}
 
 	m = rxq->mbuf_cache[rxq->mbuf_cache_head];
+	if (data_iova != NULL)
+		*data_iova = rxq->mbuf_cache_iova[rxq->mbuf_cache_head];
 	rxq->mbuf_cache[rxq->mbuf_cache_head] = NULL;
+	rxq->mbuf_cache_iova[rxq->mbuf_cache_head] = 0;
 	rxq->mbuf_cache_head =
 		(uint16_t)((rxq->mbuf_cache_head + 1) % DCP_MBUF_CACHE_SIZE);
 	rxq->mbuf_cache_count--;
@@ -655,6 +798,7 @@ dcp_rxq_free_mbuf_cache(struct dcp_rx_queue *rxq)
 		struct rte_mbuf *m = rxq->mbuf_cache[rxq->mbuf_cache_head];
 
 		rxq->mbuf_cache[rxq->mbuf_cache_head] = NULL;
+		rxq->mbuf_cache_iova[rxq->mbuf_cache_head] = 0;
 		rxq->mbuf_cache_head =
 			(uint16_t)((rxq->mbuf_cache_head + 1) % DCP_MBUF_CACHE_SIZE);
 		rxq->mbuf_cache_count--;
@@ -671,15 +815,14 @@ dcp_mbuf_cookie_ptr(struct rte_mbuf *m)
 }
 
 static int
-dcp_rxq_grant_mbuf(struct dcp_rx_queue *rxq, struct rte_mbuf *m)
+dcp_rxq_grant_mbuf(struct dcp_rx_queue *rxq, struct rte_mbuf *m,
+		uint64_t data_iova)
 {
 	uint16_t tail;
-	uint64_t data_iova;
 
 	if (rxq->granted_mbuf_count >= DCP_MAX_GRANTED_RX_BUFS)
 		return -ENOSPC;
 
-	data_iova = rte_mbuf_data_iova_default(m);
 	*dcp_mbuf_cookie_ptr(m) = (uintptr_t)m;
 	tail = (uint16_t)((rxq->granted_mbuf_head + rxq->granted_mbuf_count) %
 		DCP_MAX_GRANTED_RX_BUFS);
@@ -880,8 +1023,9 @@ dcp_txq_request_credits_if_needed(struct dcp_tx_queue *txq)
 	dcp_pack(buf, BP_RC_SENDER, sender, BW_RC_SENDER);
 
 	dst = txq->ring + (uint64_t)txq->tail * DCP_CREDIT_SIZE;
-	rte_memcpy((void *)(uintptr_t)dst, buf, DCP_CREDIT_SIZE);
-	rte_wmb();
+	// rte_memcpy((void *)(uintptr_t)dst, buf, DCP_CREDIT_SIZE);
+	rte_mov64((void *)(uintptr_t)dst, buf);
+	// rte_wmb();
 
 	txq->tail = (txq->tail + 1) % txq->size;
 	txq->credits--;
@@ -911,14 +1055,14 @@ eth_dcp_rx(void *rxq_ptr, struct rte_mbuf **pkts, uint16_t nb_pkts)
 	for (uint16_t i = 0; (i < DCP_RX_MAX_BURST) && (nb_rx < nb_pkts); ++i) {
 		volatile uint8_t *slot = rxq->ring +
 			(uint64_t)(rxq->head & mask) * DCP_CREDIT_SIZE;
-		uint8_t ct = (uint8_t)dcp_unpack(slot, BP_CMD_TYPE, BW_CMD_TYPE);
+		uint8_t ct = dcp_cmd_type_fast(slot);
 
 		if (ct == DCP_CMD_EMPTY)
 			break;
 
 		if (ct == DCP_CMD_IN_VALUE) {
-			uint32_t sz = (uint32_t)dcp_unpack(slot,
-					BP_IV_SIZE, BW_IV_SIZE);
+			struct dcp_hdr128 hdr = dcp_load_hdr128(slot);
+			uint32_t sz = dcp_in_value_size_fast(hdr);
 			
 			// TODO(sadok): Add support for larger pass by value.
 			// uint32_t ncreds =
@@ -926,7 +1070,7 @@ eth_dcp_rx(void *rxq_ptr, struct rte_mbuf **pkts, uint16_t nb_pkts)
 			// 	 DCP_CREDIT_SIZE - 1) / DCP_CREDIT_SIZE;
 			uint32_t ncreds = 1;
 
-			struct rte_mbuf *m = dcp_rxq_get_mbuf(rxq);
+			struct rte_mbuf *m = dcp_rxq_get_mbuf(rxq, NULL);
 			if (unlikely(!m))
 				break;
 			const uint8_t *src = (const uint8_t *)(uintptr_t)slot +
@@ -948,13 +1092,12 @@ eth_dcp_rx(void *rxq_ptr, struct rte_mbuf **pkts, uint16_t nb_pkts)
 			processed += ncreds;
 
 		} else if (ct == DCP_CMD_IN_REF) {
-			uint32_t sz   = (uint32_t)dcp_unpack(slot,
-					BP_IR_SIZE, BW_IR_SIZE);
-			uint64_t addr = dcp_unpack(slot,
-					BP_IR_ADDR, BW_IR_ADDR);
+			struct dcp_hdr128 hdr = dcp_load_hdr128(slot);
+			uint32_t sz = dcp_in_ref_size_fast(hdr);
+			uint64_t addr = dcp_in_ref_addr_fast(slot);
 
 			struct rte_mbuf *m = dcp_rxq_take_granted_mbuf(rxq, addr);
-			if (m == NULL) {
+			if (unlikely(m == NULL)) {
 				// We didn't grant this buffer, treat it as virtual address.
 				m = dcp_rxq_mbuf_from_data_addr(addr);
 			}
@@ -977,18 +1120,17 @@ eth_dcp_rx(void *rxq_ptr, struct rte_mbuf **pkts, uint16_t nb_pkts)
 			++processed;
 
 		} else if (ct == DCP_CMD_REQ_BUF) {
-			uint32_t sz     = (uint32_t)dcp_unpack(slot,
-					BP_RB_SIZE, BW_RB_SIZE);
-			uint64_t sender = dcp_unpack(slot,
-					BP_RB_SENDER, BW_RB_SENDER);
-			struct rte_mbuf *m = dcp_rxq_get_mbuf(rxq);
+			struct dcp_hdr128 hdr = dcp_load_hdr128(slot);
+			uint32_t sz = dcp_req_buf_size_fast(hdr);
+			uint64_t sender = dcp_req_buf_sender_fast(hdr);
 			uint64_t buf_addr = 0;
+			struct rte_mbuf *m = dcp_rxq_get_mbuf(rxq, &buf_addr);
 
 			if (m != NULL) {
 				if (likely(sz <= rte_pktmbuf_tailroom(m)) &&
-				    dcp_rxq_grant_mbuf(rxq, m) == 0) {
-					buf_addr = rte_mbuf_data_iova_default(m);
+				    dcp_rxq_grant_mbuf(rxq, m, buf_addr) == 0) {
 				} else {
+					buf_addr = 0;
 					DCP_LOG(NOTICE, "freeing mbuf for ReqBuf sz=%u sender=0x%" PRIx64 "\n",
 						sz, sender);
 					rte_pktmbuf_free(m);
@@ -1002,6 +1144,10 @@ eth_dcp_rx(void *rxq_ptr, struct rte_mbuf **pkts, uint16_t nb_pkts)
 					sz, sender);
 			}
 
+		#if defined(__x86_64__) || defined(__i386__)
+			__m512i resp = dcp_build_resp_buf_req_zmm(sz, buf_addr);
+			dcp_write_resp_zmm_to_bar2(a, sender, resp);
+		#else
 			uint8_t resp[DCP_CREDIT_SIZE];
 			memset(resp, 0, sizeof(resp));
 			dcp_pack(resp, BP_CMD_TYPE, DCP_CMD_RESP, BW_CMD_TYPE);
@@ -1011,20 +1157,18 @@ eth_dcp_rx(void *rxq_ptr, struct rte_mbuf **pkts, uint16_t nb_pkts)
 				 (buf_addr != 0) ? 1 : 0, BW_RBR_SUCCESS);
 			dcp_pack(resp, BP_RBR_SIZE, sz, BW_RBR_SIZE);
 			dcp_pack(resp, BP_RBR_ADDR, buf_addr, BW_RBR_ADDR);
-			dcp_write_resp_to_bar2(a, sender,
-					       resp, sizeof(resp));
+			dcp_write_resp_to_bar2(a, sender, resp, sizeof(resp));
+		#endif
 
 			*(volatile uint64_t *)(uintptr_t)slot = 0;
 			++(rxq->head);
 			++processed;
 
 		} else if (ct == DCP_CMD_REQ_CRED) {
-			uint32_t requested = (uint32_t)dcp_unpack(slot,
-					BP_RC_NCREDS, BW_RC_NCREDS);
-			bool blocking = dcp_unpack(slot,
-					BP_RC_BLOCKING, 1) != 0;
-			uint64_t sender = dcp_unpack(slot,
-					BP_RC_SENDER, BW_RC_SENDER);
+			struct dcp_hdr128 hdr = dcp_load_hdr128(slot);
+			uint32_t requested = dcp_req_cred_ncreds_fast(hdr);
+			bool blocking = dcp_req_cred_blocking_fast(hdr);
+			uint64_t sender = dcp_req_cred_sender_fast(hdr);
 
 			if (unlikely(dcp_rxq_enqueue_pending_cred_req(rxq, blocking,
 					requested, sender) != 0)) {
@@ -1045,6 +1189,8 @@ eth_dcp_rx(void *rxq_ptr, struct rte_mbuf **pkts, uint16_t nb_pkts)
 
 	rxq->freed_creds += processed;
 	dcp_rxq_process_pending_cred_reqs(rxq, a);
+
+	rte_wmb();
 	return nb_rx;
 }
 
@@ -1097,11 +1243,12 @@ eth_dcp_tx(void *txq_ptr, struct rte_mbuf **pkts, uint16_t nb_pkts)
 		/* Write 1 credit to BAR2 (write-combined region). */
 		volatile uint8_t *dst = txq->ring +
 			(uint64_t)txq->tail * DCP_CREDIT_SIZE;
-		rte_memcpy((void *)(uintptr_t)dst, buf, DCP_CREDIT_SIZE);
+		// rte_memcpy((void *)(uintptr_t)dst, buf, DCP_CREDIT_SIZE);
+		rte_mov64((void *)(uintptr_t)dst, buf);
 
 		/* Flush the write-combining buffer so the device sees
 		 * the InRef command. */
-		rte_wmb();
+		// rte_wmb();
 
 		txq->tail = (txq->tail + 1) & tail_mask;
 		--(txq->credits);
@@ -1202,7 +1349,7 @@ eth_dcp_tx_queue_setup(struct rte_eth_dev *dev, uint16_t qid,
 	txq->tail     = 0;
 	txq->size     = a->queue_depth;
 	txq->credits  = DCP_CORE_MAX_CREDITS;
-	txq->cred_req_thresh = txq->credits / 4;
+	txq->cred_req_thresh = txq->credits / 2;
 	txq->consumed_credits = 0;
 	txq->pending_mbuf_size = txq->credits;
 	txq->pending_mbuf_head = 0;
